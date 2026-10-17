@@ -1,0 +1,139 @@
+name: Docs Sync
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'src/**'
+      - 'api/**'
+      - 'config/**'
+      - 'docs/**'
+      - '.github/workflows/docs-sync.yml'
+  pull_request:
+    branches:
+      - main
+      - master
+    types:
+      - opened
+      - synchronize
+      - reopened
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync-docs:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: .
+      DOCS_OUTPUT_DIR: docs/generated
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Determine changed files
+        id: diff
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_REF="${{ github.event.pull_request.base.sha }}"
+            HEAD_REF="${{ github.sha }}"
+          else
+            BASE_REF="$(git rev-parse HEAD^ 2>/dev/null || echo HEAD)"
+            HEAD_REF="${{ github.sha }}"
+          fi
+
+          git diff --name-status "$BASE_REF" "$HEAD_REF" > diff.txt || true
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from src.parser import parse_name_status
+
+          diff_text = Path('diff.txt').read_text(encoding='utf-8') if Path('diff.txt').exists() else ''
+          changes = parse_name_status(diff_text, source_commit='workflow-run')
+          Path('changes.json').write_text(json.dumps([change.__dict__ for change in changes], indent=2), encoding='utf-8')
+          print(f"Detected {len(changes)} relevant change(s).")
+          PY
+
+      - name: Generate documentation updates
+        shell: bash
+        run: |
+          mkdir -p docs/generated
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from src.generator import generate_documentation_update, render_pr_summary
+          from src.parser import parse_name_status
+
+          diff_text = Path('diff.txt').read_text(encoding='utf-8') if Path('diff.txt').exists() else ''
+          changes = parse_name_status(diff_text, source_commit='workflow-run')
+          patches = generate_documentation_update(changes, doc_root='docs')
+
+          for patch in patches:
+              target = Path(patch.target)
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_text(patch.content, encoding='utf-8')
+
+          summary_path = Path('docs/generated/summary.md')
+          summary_path.write_text(render_pr_summary(changes), encoding='utf-8')
+          print(f"Generated {len(patches)} documentation patch(es).")
+          PY
+
+      - name: Validate generated markdown
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          generated = list(Path('docs/generated').rglob('*.md'))
+          if not generated:
+              print('No generated markdown files found.')
+              raise SystemExit(0)
+
+          for path in generated:
+              content = path.read_text(encoding='utf-8')
+              if not content.strip():
+                  raise ValueError(f'{path} is empty.')
+          print(f'Validated {len(generated)} markdown file(s).')
+          PY
+
+      - name: Notify review workflow
+        env:
+          DOCS_SYNC_WEBHOOK: ${{ secrets.DOCS_SYNC_WEBHOOK }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from src.notifier import Notification, send_notification
+
+          summary = Path('docs/generated/summary.md').read_text(encoding='utf-8') if Path('docs/generated/summary.md').exists() else 'No documentation changes detected.'
+          notification = Notification(title='Docs Sync Run', body=summary[:4000])
+          send_notification(notification, webhook_url=os.getenv('DOCS_SYNC_WEBHOOK'))
+          PY
+
+      - name: Commit generated docs
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/generated
+          if git diff --cached --quiet; then
+            echo "No documentation updates to commit."
+            exit 0
+          fi
+          git commit -m "chore: sync generated documentation"
+          git push
